@@ -111,19 +111,29 @@ export default function SettingsModal({
       });
   };
 
-  // --- OPENING BOOK HANDLER ---
-  const handleBrowseBookPath = async () => {
+  // --- OPENINGS FILE HANDLER (PGN/EPT/FEN) ---
+  // Backward compatibility: show and keep opening.book_path if it exists, but prefer opening.file
+  const openingsPath: string = ((opening as any).file ?? (opening as any).book_path ?? '') as string;
+
+  const handleBrowseOpeningsFile = async () => {
     try {
       const selected = await open({
-        title: 'Select Opening Book',
-        defaultPath: opening.book_path || '.',
-        filters: [{ name: 'Books', extensions: ['bin', 'pgn', 'epd'] }]
+        title: 'Select Openings File',
+        defaultPath: openingsPath || '.',
+        multiple: false,
+        filters: [
+          { name: 'Openings (PGN/EPD/FEN)', extensions: ['pgn', 'epd', 'fen'] },
+          { name: 'Polyglot book (BIN) — not supported yet', extensions: ['bin'] },
+        ]
       });
+
       if (selected && typeof selected === 'string') {
-        onUpdateOpening({ ...opening, book_path: selected });
+        // Write to opening.file (backend expects this), keep book_path as compat/fallback
+        const updated: any = { ...opening, file: selected, book_path: selected };
+        onUpdateOpening(updated);
       }
     } catch (err) {
-      console.error('Failed to open book dialog:', err);
+      console.error('Failed to open openings dialog:', err);
     }
   };
 
@@ -139,6 +149,12 @@ export default function SettingsModal({
       });
       onUpdateEngines(updatedEngines);
   };
+
+  // Tournament modes supported by backend
+  const supportedModes = ['Match', 'RoundRobin', 'Gauntlet'] as const;
+  const currentMode = supportedModes.includes(tournamentSettings.mode as any)
+    ? tournamentSettings.mode
+    : 'Match';
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
@@ -350,20 +366,20 @@ export default function SettingsModal({
                 </div>
               </div>
 
-              {/* Opening Book Settings */}
+              {/* Openings File Settings */}
               <div className="bg-[#1e1e1e] p-4 rounded border border-[#333]">
                  <h3 className="text-sm font-bold text-gray-100 mb-3 flex items-center gap-2">
-                    <BookOpen size={14} className="text-yellow-400"/> Opening Book
+                    <BookOpen size={14} className="text-yellow-400"/> Openings File
                  </h3>
                  <div className="space-y-3">
                      <div className="flex gap-2">
                         <input
                            className="flex-1 bg-[#111] border border-[#333] rounded px-2 py-1.5 text-sm text-gray-400 outline-none"
-                           value={opening.book_path || ''}
-                           placeholder="Path to .bin / .pgn..."
+                           value={openingsPath}
+                           placeholder="Select .pgn / .epd / .fen ..."
                            readOnly
                         />
-                        <button onClick={handleBrowseBookPath} className="bg-[#333] hover:bg-[#444] text-gray-200 px-3 rounded border border-[#444]">
+                        <button onClick={handleBrowseOpeningsFile} className="bg-[#333] hover:bg-[#444] text-gray-200 px-3 rounded border border-[#444]">
                             <MoreHorizontal size={16} />
                         </button>
                      </div>
@@ -374,20 +390,24 @@ export default function SettingsModal({
                             <select
                                 className="w-full bg-[#111] border border-[#333] rounded px-2 py-1 text-sm text-gray-300 outline-none"
                                 value={opening.order || 'random'}
-                                onChange={e => onUpdateOpening({...opening, order: e.target.value})}
+                                onChange={e => onUpdateOpening({...(opening as any), order: e.target.value} as any)}
                             >
                                 <option value="random">Random</option>
                                 <option value="sequential">Sequential</option>
                             </select>
                          </div>
                          <div>
-                            <label className="block text-xs text-gray-500 mb-1">Ply Depth</label>
+                            <label className="block text-xs text-gray-500 mb-1">Opening depth (full moves)</label>
                             <input
                                type="number"
+                               min={0}
                                className="w-full bg-[#111] border border-[#333] rounded px-2 py-1 text-sm"
                                value={opening.depth || 0}
-                               onChange={e => onUpdateOpening({...opening, depth: parseInt(e.target.value)})}
+                               onChange={e => onUpdateOpening({...(opening as any), depth: parseInt(e.target.value) || 0} as any)}
                             />
+                            <p className="text-[10px] text-gray-500 mt-1">
+                              0 = default 10 full moves (20 plies)
+                            </p>
                          </div>
                      </div>
                  </div>
@@ -500,15 +520,16 @@ export default function SettingsModal({
                         <label className="block text-xs text-gray-500 mb-1">Mode</label>
                         <select
                            className="w-full bg-[#111] border border-[#333] rounded px-2 py-1 text-sm text-gray-300 outline-none"
-                           value={tournamentSettings.mode}
+                           value={currentMode}
                            onChange={e => onUpdateTournamentSettings({...tournamentSettings, mode: e.target.value as any})}
                         >
                             <option value="Match">Match</option>
                             <option value="RoundRobin">Round Robin</option>
                             <option value="Gauntlet">Gauntlet</option>
-                            <option value="Swiss">Swiss</option>
-                            <option value="Pyramid">Pyramid</option>
                         </select>
+                        <p className="text-[10px] text-gray-500 mt-1">
+                          Swiss/Pyramid are UI-only for now (backend not supported).
+                        </p>
                      </div>
                      <div>
                         <label className="block text-xs text-gray-500 mb-1">Variant</label>

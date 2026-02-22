@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::task::JoinSet;
 use std::path::Path;
 
+use pgn_reader::{BufferedReader, Visitor, Skip, RawHeader, SanPlus};
+
 const ENGINE_SPAWN_FAILURE_LIMIT: u32 = 3;
 
 enum Board {
@@ -36,6 +38,20 @@ impl Board {
     }
 }
 
+#[derive(Clone, Debug)]
+struct OpeningLine {
+    start_fen: String,
+    moves_uci: Vec<String>,
+}
+
+fn opening_depth_fullmoves(config: &TournamentConfig) -> usize {
+    // UI rule: None or 0 => default 10 full moves (20 plies)
+    match config.opening.depth {
+        Some(d) if d > 0 => d as usize,
+        _ => 10,
+    }
+}
+
 pub struct Arbiter {
     active_engines: Arc<Mutex<Vec<AsyncEngine>>>,
     config: TournamentConfig,
@@ -47,7 +63,7 @@ pub struct Arbiter {
     error_tx: mpsc::Sender<TournamentError>,
     should_stop: Arc<Mutex<bool>>,
     is_paused: Arc<Mutex<bool>>,
-    openings: Vec<String>,
+    openings: Vec<OpeningLine>,
     tourney_stats: Arc<Mutex<TournamentStats>>,
     schedule_queue: Arc<Mutex<VecDeque<ScheduleItem>>>,
     pairing_states: Arc<Mutex<Vec<PairingState>>>,
@@ -109,9 +125,36 @@ impl Arbiter {
         schedule_update_tx: mpsc::Sender<ScheduledGame>, // Added
         error_tx: mpsc::Sender<TournamentError>
     ) -> anyhow::Result<Self> {
-        let mut openings = Vec::new();
-        if let Some(ref path) = config.opening.file {
-            openings = load_openings(path)?;
+        let mut openings: Vec<OpeningLine> = Vec::new();
+
+        // Backward compatibility: UI may send opening.book_path while backend prefers opening.file
+        let opening_path = config.opening.file.as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| config.opening.book_path.as_deref().filter(|p| !p.trim().is_empty()));
+
+        if let Some(path) = opening_path {
+            let depth_fullmoves = opening_depth_fullmoves(&config);
+            match load_openings(path, &config.variant, depth_fullmoves) {
+                Ok(v) => {
+                    println!("[Openings] Loaded {} lines from {} (depth={} full moves)", v.len(), path, depth_fullmoves);
+                    if let Some(first) = v.first() {
+                        println!("[Openings] First line: {} plies", first.moves_uci.len());
+                    }
+                    openings = v;
+                }
+                Err(e) => {
+                    println!("[Openings] Failed to load {}: {}", path, e);
+                    let _ = error_tx.send(TournamentError {
+                        engine_id: None,
+                        engine_name: "Openings".to_string(),
+                        game_id: None,
+                        message: format!("Failed to load openings from {}: {}", path, e),
+                        failure_count: 0,
+                        disabled: false,
+                    }).await;
+                    openings = Vec::new(); // fallback: run tournament without openings
+                }
+            }
         }
 
         if let Some(order) = &config.opening.order {
@@ -671,18 +714,26 @@ impl Arbiter {
                 let white_name_pgn = config.engines[white_idx].name.clone();
                 let black_name_pgn = config.engines[black_idx].name.clone();
 
-                let start_fen = if !openings.is_empty() {
+                let (start_fen, opening_moves): (String, Vec<String>) = if !openings.is_empty() {
                     let idx = if config.swap_sides { (game.game_idx / 2) as usize } else { game.game_idx as usize };
-                    openings[idx % openings.len()].clone()
+                    let line = &openings[idx % openings.len()];
+                    (line.start_fen.clone(), line.moves_uci.clone())
                 } else if let Some(ref f) = config.opening.fen {
-                    if !f.trim().is_empty() { f.clone() } else { generate_start_fen(&config.variant) }
+                    if !f.trim().is_empty() {
+                        (f.clone(), Vec::new())
+                    } else {
+                        (generate_start_fen(&config.variant), Vec::new())
+                    }
                 } else {
-                    generate_start_fen(&config.variant)
+                    (generate_start_fen(&config.variant), Vec::new())
                 };
 
+                println!("[Game {}] Opening plies: {}", game.id, opening_moves.len());
+
                 let res = play_game_static(
-                    white_engine, black_engine, white_idx, black_idx, &start_fen,
-        &config, &game_update_tx, &should_stop, &is_paused, game.id
+                    white_engine, black_engine, white_idx, black_idx,
+                    &start_fen, &opening_moves,
+                    &config, &game_update_tx, &should_stop, &is_paused, game.id
                 ).await;
 
                 match res {
@@ -710,9 +761,6 @@ impl Arbiter {
                             let is_white_a = white_idx == 0;
                             stats.update(&result, is_white_a);
 
-                            // Re-calculate Standings from Schedule State
-                            // This is a bit heavy (O(N) where N is games), but safe for <10k games
-                            // Better than maintaining complex incremental state
                             let schedule = schedule_state.lock().await.clone();
                             let standings = crate::stats::calculate_standings(&schedule, &config.engines);
                             stats.update_standings(standings);
@@ -990,6 +1038,7 @@ async fn play_game_static(
     white_idx: usize,
     black_idx: usize,
     start_fen: &str,
+    opening_moves: &[String],
     config: &TournamentConfig,
     game_update_tx: &mpsc::Sender<GameUpdate>,
     should_stop: &Arc<Mutex<bool>>,
@@ -1007,18 +1056,13 @@ async fn play_game_static(
          Board::Standard(pos_std)
     };
 
-    // Initialize engines with proper UCI handshake
-    initialize_engine(white_engine, &config.engines[white_idx], &config.variant).await?;
-    initialize_engine(black_engine, &config.engines[black_idx], &config.variant).await?;
-
     let mut white_time = config.time_control.base_ms as i64;
     let mut black_time = config.time_control.base_ms as i64;
     let inc = config.time_control.inc_ms as i64;
     let mut moves_history: Vec<String> = Vec::new();
 
-    let mut consec_resign_moves = 0;
-    let mut consec_draw_moves = 0;
-    let mut game_result;
+    let game_result;
+
     let mut repetition_counts: HashMap<String, u32> = HashMap::new();
     let mut halfmove_clock: u32 = start_fen
         .split_whitespace()
@@ -1031,6 +1075,121 @@ async fn play_game_static(
     };
     repetition_counts.insert(repetition_key(&pos.to_fen_string()), 1);
 
+    // Send initial reset/update so UI can reset board immediately
+    let _ = game_update_tx.send(GameUpdate {
+        fen: pos.to_fen_string(),
+        last_move: None,
+        white_time: white_time as u64,
+        black_time: black_time as u64,
+        move_number: 1,
+        result: None,
+        white_engine_idx: white_idx,
+        black_engine_idx: black_idx,
+        game_id
+    }).await;
+
+    // Apply opening moves (UCI), sending a GameUpdate after each ply
+    for mv_uci in opening_moves {
+        if *should_stop.lock().await {
+            return Err(anyhow::anyhow!("stopped"));
+        }
+        while *is_paused.lock().await {
+            if *should_stop.lock().await {
+                return Err(anyhow::anyhow!("stopped"));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let current_move_num = (moves_history.len() / 2) + 1;
+
+        let parsed_move = match &mut pos {
+            Board::Standard(b) => {
+                let uci: Uci = mv_uci.parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid UCI in opening line: {}", mv_uci))?;
+                uci.to_move(b)
+            },
+            Board::Chess960(b) => {
+                let uci: Uci = mv_uci.parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid UCI in opening line: {}", mv_uci))?;
+                uci.to_move(b)
+            }
+        };
+
+        let m = parsed_move
+            .map_err(|_| anyhow::anyhow!("Illegal opening move {} for position {}", mv_uci, pos.to_fen_string()))?;
+
+        pos.play_unchecked(&m);
+        moves_history.push(mv_uci.clone());
+
+        if m.is_zeroing() {
+            halfmove_clock = 0;
+        } else {
+            halfmove_clock = halfmove_clock.saturating_add(1);
+        }
+
+        let repetition_count = repetition_counts
+            .entry(repetition_key(&pos.to_fen_string()))
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+
+        if *repetition_count >= 3 || halfmove_clock >= 100 {
+            game_result = "1/2-1/2".to_string();
+            let _ = game_update_tx.send(GameUpdate {
+                fen: pos.to_fen_string(),
+                last_move: Some(mv_uci.clone()),
+                white_time: white_time as u64,
+                black_time: black_time as u64,
+                move_number: (current_move_num + 1) as u32,
+                result: Some(game_result.clone()),
+                white_engine_idx: white_idx,
+                black_engine_idx: black_idx,
+                game_id
+            }).await;
+            return Ok((game_result, moves_history));
+        }
+
+        let _ = game_update_tx.send(GameUpdate {
+            fen: pos.to_fen_string(),
+            last_move: Some(mv_uci.clone()),
+            white_time: white_time as u64,
+            black_time: black_time as u64,
+            move_number: (current_move_num + 1) as u32,
+            result: None,
+            white_engine_idx: white_idx,
+            black_engine_idx: black_idx,
+            game_id
+        }).await;
+
+        if pos.is_game_over() {
+            let outcome = pos.outcome().unwrap();
+            let result_str = match outcome {
+                shakmaty::Outcome::Decisive { winner: Color::White } => "1-0",
+                shakmaty::Outcome::Decisive { winner: Color::Black } => "0-1",
+                shakmaty::Outcome::Draw => "1/2-1/2",
+            };
+            game_result = result_str.to_string();
+            let _ = game_update_tx.send(GameUpdate {
+                fen: pos.to_fen_string(),
+                last_move: None,
+                white_time: white_time as u64,
+                black_time: black_time as u64,
+                move_number: ((moves_history.len() / 2) + 1) as u32,
+                result: Some(game_result.clone()),
+                white_engine_idx: white_idx,
+                black_engine_idx: black_idx,
+                game_id
+            }).await;
+            return Ok((game_result, moves_history));
+        }
+    }
+
+    // Initialize engines with proper UCI handshake AFTER opening moves
+    initialize_engine(white_engine, &config.engines[white_idx], &config.variant).await?;
+    initialize_engine(black_engine, &config.engines[black_idx], &config.variant).await?;
+
+    let mut consec_resign_moves = 0;
+    let mut consec_draw_moves = 0;
+
     loop {
         if *should_stop.lock().await {
             return Err(anyhow::anyhow!("stopped"));
@@ -1039,7 +1198,6 @@ async fn play_game_static(
 
         let current_move_num = (moves_history.len() / 2) + 1;
 
-        // Material Draw Adjudication (Strict K vs K or Insufficient Material)
         let material_draw = match &pos {
              Board::Standard(b) => b.is_insufficient_material(),
              Board::Chess960(b) => b.is_insufficient_material(),
@@ -1077,8 +1235,15 @@ async fn play_game_static(
             Color::Black => (black_engine, black_time, white_time),
         };
 
-        let mut pos_cmd = format!("position fen {} moves", start_fen);
-        for m in &moves_history { pos_cmd.push_str(" "); pos_cmd.push_str(m); }
+        // IMPORTANT: don't send a bare "moves" with no moves
+        let mut pos_cmd = format!("position fen {}", start_fen);
+        if !moves_history.is_empty() {
+            pos_cmd.push_str(" moves");
+            for m in &moves_history {
+                pos_cmd.push_str(" ");
+                pos_cmd.push_str(m);
+            }
+        }
         active_engine.send(pos_cmd).await?;
 
         let go_cmd = format!("go wtime {} btime {} winc {} binc {}", white_time, black_time, inc, inc);
@@ -1090,7 +1255,6 @@ async fn play_game_static(
         let mut move_score: Option<i32> = None;
 
         let time_left = if turn == Color::White { white_time } else { black_time };
-        // Timeout: Remaining time + 5s buffer, capped at 24h
         let timeout_ms = (time_left + 5000).max(5000) as u64;
         let max_cap_ms = 24 * 60 * 60 * 1000;
         let timeout_duration = Duration::from_millis(timeout_ms.min(max_cap_ms));
@@ -1133,7 +1297,6 @@ async fn play_game_static(
         match timeout(timeout_duration, bestmove_future).await {
             Ok(Ok(_)) => {},
             Ok(Err(e)) => {
-                 // Engine disconnected/closed
                  println!("Engine error: {}", e);
                  game_result = match turn { Color::White => "0-1", Color::Black => "1-0" }.to_string();
                  let _ = game_update_tx.send(GameUpdate {
@@ -1144,7 +1307,6 @@ async fn play_game_static(
                 break;
             },
             Err(_) => {
-                 // Timed out
                  println!("Engine timed out!");
                  let _ = active_engine.kill().await;
                  game_result = match turn { Color::White => "0-1", Color::Black => "1-0" }.to_string();
@@ -1163,9 +1325,7 @@ async fn play_game_static(
             Color::Black => black_time = (black_time - elapsed).max(0) + inc,
         }
 
-        // Adjudication Checks
         if let Some(score) = move_score {
-             // Resign Adjudication
              let resign_threshold = config.adjudication.resign_score.unwrap_or(1000);
              let resign_count_limit = config.adjudication.resign_move_count.unwrap_or(5);
 
@@ -1175,8 +1335,7 @@ async fn play_game_static(
                  consec_resign_moves = 0;
              }
 
-             // Draw Adjudication
-             let draw_threshold = config.adjudication.draw_score.unwrap_or(5); // +/- cp
+             let draw_threshold = config.adjudication.draw_score.unwrap_or(5);
              let draw_start = config.adjudication.draw_move_number.unwrap_or(40);
              let draw_count_limit = config.adjudication.draw_move_count.unwrap_or(20);
 
@@ -1246,7 +1405,6 @@ async fn play_game_static(
             }
         } else {
              println!("Illegal/Unparseable move from {}: {}", if turn == Color::White { "White" } else { "Black" }, best_move_str);
-             // Forfeit the engine that made the illegal move
              game_result = match turn {
                  Color::White => "0-1",
                  Color::Black => "1-0",
@@ -1268,32 +1426,242 @@ async fn play_game_static(
     Ok((game_result, moves_history))
 }
 
-fn load_openings(path: &str) -> anyhow::Result<Vec<String>> {
-    let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("Failed to open opening file: {}", e))?;
+struct OpeningPgnVisitor {
+    variant: String,
+    max_plies: usize,
+
+    // per-game state
+    start_fen: Option<String>,
+    moves_uci: Vec<String>,
+    pos: Option<Chess>,
+    error: Option<anyhow::Error>,
+
+    // variation handling (robust across pgn-reader behavior)
+    variation_depth: u32,
+    mainline_depth: Option<u32>,
+}
+
+impl OpeningPgnVisitor {
+    fn new(variant: &str, max_plies: usize) -> Self {
+        Self {
+            variant: variant.to_string(),
+            max_plies,
+            start_fen: None,
+            moves_uci: Vec::new(),
+            pos: None,
+            error: None,
+            variation_depth: 0,
+            mainline_depth: None,
+        }
+    }
+
+    fn reset_game(&mut self) {
+        self.start_fen = None;
+        self.moves_uci.clear();
+        self.pos = None;
+        self.error = None;
+        self.variation_depth = 0;
+        self.mainline_depth = None;
+    }
+
+    fn init_pos_if_needed(&mut self) -> anyhow::Result<()> {
+        if self.pos.is_some() {
+            return Ok(());
+        }
+
+        let fen = match self.start_fen.as_deref().map(str::trim) {
+            Some(f) if !f.is_empty() => f.to_string(),
+            _ => {
+                if self.variant == "chess960" {
+                    return Err(anyhow::anyhow!("PGN opening in chess960 requires a [FEN \"...\"] tag"));
+                }
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string()
+            }
+        };
+
+        let setup = Fen::from_ascii(fen.as_bytes())?;
+        let pos: Chess = if self.variant == "chess960" {
+            setup.into_position(CastlingMode::Chess960)?
+        } else {
+            setup.into_position(CastlingMode::Standard)?
+        };
+
+        if self.start_fen.is_none() {
+            self.start_fen = Some(fen);
+        }
+
+        self.pos = Some(pos);
+        Ok(())
+    }
+
+    fn is_mainline(&mut self) -> bool {
+        if self.mainline_depth.is_none() {
+            self.mainline_depth = Some(self.variation_depth);
+        }
+        self.variation_depth == self.mainline_depth.unwrap_or(0)
+    }
+
+    fn castling_mode(&self) -> CastlingMode {
+        if self.variant == "chess960" {
+            CastlingMode::Chess960
+        } else {
+            CastlingMode::Standard
+        }
+    }
+}
+
+impl Visitor for OpeningPgnVisitor {
+    type Result = anyhow::Result<Option<OpeningLine>>;
+
+    fn begin_game(&mut self) {
+        self.reset_game();
+    }
+
+    fn header(&mut self, key: &[u8], value: RawHeader<'_>) {
+        if key.eq_ignore_ascii_case(b"FEN") {
+            if let Ok(fen) = value.decode_utf8() {
+                self.start_fen = Some(fen.into_owned());
+            }
+        }
+    }
+
+    fn begin_variation(&mut self) -> Skip {
+        self.variation_depth = self.variation_depth.saturating_add(1);
+
+        // Once we know the mainline depth, we can skip deeper variations entirely.
+        if let Some(main) = self.mainline_depth {
+            if self.variation_depth > main {
+                return Skip(true);
+            }
+        }
+
+        Skip(false)
+    }
+
+    fn end_variation(&mut self) {
+        self.variation_depth = self.variation_depth.saturating_sub(1);
+    }
+
+    fn san(&mut self, san: SanPlus) {
+        if self.error.is_some() {
+            return;
+        }
+
+        // Only mainline moves
+        if !self.is_mainline() {
+            return;
+        }
+
+        if self.moves_uci.len() >= self.max_plies {
+            return;
+        }
+
+        if let Err(e) = self.init_pos_if_needed() {
+            self.error = Some(e);
+            return;
+        }
+
+        let pos_ref = match self.pos.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let m = match san.san.to_move(pos_ref) {
+            Ok(m) => m,
+            Err(e) => {
+                self.error = Some(anyhow::anyhow!("Failed to convert SAN {:?} to move: {}", san, e));
+                return;
+            }
+        };
+
+        let uci_str = Uci::from_move(&m, self.castling_mode()).to_string();
+        self.moves_uci.push(uci_str);
+
+        if let Some(p) = self.pos.as_mut() {
+            p.play_unchecked(&m);
+        }
+    }
+
+    fn end_game(&mut self) -> Self::Result {
+        if let Some(err) = self.error.take() {
+            eprintln!("Skipping PGN game in opening file: {}", err);
+            return Ok(None);
+        }
+
+        if let Err(e) = self.init_pos_if_needed() {
+            eprintln!("Skipping PGN game in opening file: {}", e);
+            return Ok(None);
+        }
+
+        let start_fen = match self.start_fen.as_ref() {
+            Some(f) => f.clone(),
+            None => {
+                if self.variant == "chess960" {
+                    return Ok(None);
+                }
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string()
+            }
+        };
+
+        Ok(Some(OpeningLine {
+            start_fen,
+            moves_uci: self.moves_uci.clone(),
+        }))
+    }
+}
+
+fn load_openings(path: &str, variant: &str, depth_fullmoves: usize) -> anyhow::Result<Vec<OpeningLine>> {
+    if path.ends_with(".bin") {
+        return Err(anyhow::anyhow!("Polyglot .bin is NOT supported yet (PGN/EPD/FEN only for now)"));
+    }
+
+    let max_plies = depth_fullmoves.saturating_mul(2);
+
+    if path.ends_with(".pgn") {
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("Failed to open opening PGN file: {}", e))?;
+        let mut reader = BufferedReader::new(file);
+        let mut visitor = OpeningPgnVisitor::new(variant, max_plies);
+
+        let mut lines: Vec<OpeningLine> = Vec::new();
+        while let Some(game_res) = reader.read_game(&mut visitor)? {
+            match game_res? {
+                Some(line) => lines.push(line),
+                None => {}
+            }
+        }
+
+        if lines.is_empty() {
+            return Err(anyhow::anyhow!("No valid opening lines found in PGN file"));
+        }
+        return Ok(lines);
+    }
+
+    // .epd/.fen: one FEN per line (like before)
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open opening file: {}", e))?;
     let reader = std::io::BufReader::new(file);
-    let mut fens = Vec::new();
-    let is_pgn = path.ends_with(".pgn");
+    let mut lines: Vec<OpeningLine> = Vec::new();
 
     for line_res in reader.lines() {
         let line = line_res?;
         let line = line.trim();
         if line.is_empty() { continue; }
-        if is_pgn {
-            // Simple PGN FEN extraction
-            if line.starts_with("[FEN \"") && line.ends_with("\"]") {
-                let fen = &line[6..line.len()-2];
-                fens.push(fen.to_string());
-            }
-        } else {
-            // Assume EPD: take everything before first " ;" or just the whole line if clean
-            let parts: Vec<&str> = line.split(';').collect();
-            fens.push(parts[0].trim().to_string());
-        }
+
+        let parts: Vec<&str> = line.split(';').collect();
+        let fen = parts[0].trim();
+        if fen.is_empty() { continue; }
+
+        lines.push(OpeningLine {
+            start_fen: fen.to_string(),
+            moves_uci: Vec::new(),
+        });
     }
-    if fens.is_empty() {
+
+    if lines.is_empty() {
         return Err(anyhow::anyhow!("No valid openings found in file"));
     }
-    Ok(fens)
+    Ok(lines)
 }
 
 fn parse_info(line: &str, engine_idx: usize) -> Option<EngineStats> {
@@ -1345,7 +1713,7 @@ fn parse_info(line: &str, engine_idx: usize) -> Option<EngineStats> {
             _ => {}
         }
     }
-    Some(EngineStats { depth, score_cp, score_mate, nodes, nps, pv, engine_idx, game_id: 0, tb_hits: None, hash_full: None }) // Placeholder 0, will be overwritten or context aware
+    Some(EngineStats { depth, score_cp, score_mate, nodes, nps, pv, engine_idx, game_id: 0, tb_hits: None, hash_full: None })
 }
 
 fn parse_info_with_id(line: &str, engine_idx: usize, game_id: usize) -> Option<EngineStats> {
